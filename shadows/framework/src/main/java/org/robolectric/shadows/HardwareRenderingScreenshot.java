@@ -21,6 +21,7 @@ import android.view.ViewRootImpl;
 import com.android.internal.R;
 import java.util.Objects;
 import java.util.WeakHashMap;
+import java.util.function.Function;
 import org.robolectric.RuntimeEnvironment;
 import org.robolectric.annotation.GraphicsMode;
 import org.robolectric.shadow.api.Shadow;
@@ -62,6 +63,16 @@ public final class HardwareRenderingScreenshot {
    * https://googleplex-android.googlesource.com/platform/frameworks/layoutlib/+/refs/heads/master-layoutlib-native/bridge/src/com/android/layoutlib/bridge/impl/RenderSessionImpl.java#573
    */
   static void takeScreenshot(View view, Bitmap destBitmap) {
+    capturePlane(
+        view,
+        plane -> {
+          destBitmap.copyPixelsFromBuffer(plane.getBuffer());
+          return null;
+        });
+  }
+
+  /** Consumes the rendered RGBA plane synchronously while its ImageReader owns the pixels. */
+  static <T> T capturePlane(View view, Function<Plane, T> consumePlane) {
     int width = view.getWidth();
     int height = view.getHeight();
 
@@ -71,43 +82,46 @@ public final class HardwareRenderingScreenshot {
       Objects.requireNonNull(viewRootImpl, "View not attached");
       Surface surface = imageReader.getSurface();
 
-      if (RuntimeEnvironment.getApiLevel() >= Q) {
-        // HardwareRenderer is only available on API 29+ (Q).
-        HardwareRenderer renderer =
-            hardwareRenderers.computeIfAbsent(
-                viewRootImpl,
-                k -> {
-                  // Default to true because Views' RenderNodeAnimators write to the native
-                  // RootRenderNode state. For highest fidelity, we want to use the
-                  // HardwareRenderer that is attached to the ViewRootImpl.
-                  if (Boolean.parseBoolean(System.getProperty(USE_EMBEDDED_VIEW_ROOT, "true"))) {
-                    ShadowViewRootImpl shadowViewRootImpl = Shadow.extract(viewRootImpl);
-                    // Using Object here is required to avoid a VerifyError when this lambda class
-                    // is loaded on SDK < 29, where ThreadedRenderer is not a subclass of
-                    // HardwareRenderer.
-                    Object threadedRenderer = shadowViewRootImpl.getThreadedRenderer();
-                    return (HardwareRenderer) threadedRenderer;
-                  } else {
-                    return new HardwareRenderer();
-                  }
-                });
+      try {
+        if (RuntimeEnvironment.getApiLevel() >= Q) {
+          // HardwareRenderer is only available on API 29+ (Q).
+          HardwareRenderer renderer =
+              hardwareRenderers.computeIfAbsent(
+                  viewRootImpl,
+                  k -> {
+                    // Default to true because Views' RenderNodeAnimators write to the native
+                    // RootRenderNode state. For highest fidelity, we want to use the
+                    // HardwareRenderer that is attached to the ViewRootImpl.
+                    if (Boolean.parseBoolean(System.getProperty(USE_EMBEDDED_VIEW_ROOT, "true"))) {
+                      ShadowViewRootImpl shadowViewRootImpl = Shadow.extract(viewRootImpl);
+                      // Using Object here is required to avoid a VerifyError when this lambda class
+                      // is loaded on SDK < 29, where ThreadedRenderer is not a subclass of
+                      // HardwareRenderer.
+                      Object threadedRenderer = shadowViewRootImpl.getThreadedRenderer();
+                      return (HardwareRenderer) threadedRenderer;
+                    } else {
+                      return new HardwareRenderer();
+                    }
+                  });
 
-        renderer.setSurface(surface);
-        setupRendererShadowProperties(renderer, view);
-        RenderNode node = getRenderNode(view);
-        renderer.setContentRoot(node);
-        renderer.createRenderRequest().syncAndDraw();
-      } else {
-        // Note this API does not set any light source properties, so it will not render
-        // drop shadows.
-        Canvas canvas = surface.lockHardwareCanvas();
-        view.draw(canvas);
-        surface.unlockCanvasAndPost(canvas);
+          renderer.setSurface(surface);
+          setupRendererShadowProperties(renderer, view);
+          RenderNode node = getRenderNode(view);
+          renderer.setContentRoot(node);
+          renderer.createRenderRequest().syncAndDraw();
+        } else {
+          // Note this API does not set any light source properties, so it will not render
+          // drop shadows.
+          Canvas canvas = surface.lockHardwareCanvas();
+          view.draw(canvas);
+          surface.unlockCanvasAndPost(canvas);
+        }
+        try (Image nativeImage = imageReader.acquireNextImage()) {
+          return consumePlane.apply(nativeImage.getPlanes()[0]);
+        }
+      } finally {
+        surface.release();
       }
-      Image nativeImage = imageReader.acquireNextImage();
-      Plane[] planes = nativeImage.getPlanes();
-      destBitmap.copyPixelsFromBuffer(planes[0].getBuffer());
-      surface.release();
     }
   }
 
