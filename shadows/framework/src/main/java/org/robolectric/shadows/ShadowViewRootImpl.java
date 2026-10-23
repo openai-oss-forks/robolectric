@@ -1,5 +1,6 @@
 package org.robolectric.shadows;
 
+import static android.os.Build.VERSION_CODES.BAKLAVA;
 import static android.os.Build.VERSION_CODES.R;
 import static android.os.Build.VERSION_CODES.S_V2;
 import static android.os.Build.VERSION_CODES.TIRAMISU;
@@ -122,11 +123,33 @@ public class ShadowViewRootImpl {
 
   @Resetter
   public static void reset() {
-    ViewRootImplReflector viewRootImplStatic = reflector(ViewRootImplReflector.class);
-    viewRootImplStatic.setRunQueues(new ThreadLocal<>());
-    viewRootImplStatic.setFirstDrawHandlers(new ArrayList<>());
-    viewRootImplStatic.setFirstDrawComplete(false);
-    viewRootImplStatic.setConfigCallbacks(new ArrayList<>());
+    Throwable resetFailure = null;
+    try {
+      ViewRootImplReflector viewRootImplStatic = reflector(ViewRootImplReflector.class);
+      viewRootImplStatic.setRunQueues(new ThreadLocal<>());
+      viewRootImplStatic.setFirstDrawHandlers(new ArrayList<>());
+      viewRootImplStatic.setFirstDrawComplete(false);
+      viewRootImplStatic.setConfigCallbacks(new ArrayList<>());
+    } catch (RuntimeException | Error failure) {
+      resetFailure = failure;
+      throw failure;
+    } finally {
+      // Only this SDK can retain readers. Keep the helper uninitialized on other SDKs, and
+      // always release retained ownership here even if the reuse property was toggled off.
+      if (RuntimeEnvironment.getApiLevel() == BAKLAVA) {
+        try {
+          HardwareRenderingScreenshot.clearReaderSession();
+        } catch (RuntimeException | Error cleanupFailure) {
+          if (resetFailure == null) {
+            throw cleanupFailure;
+          }
+          // Preserve the failed static reset when reader cleanup also fails.
+          if (cleanupFailure != resetFailure) {
+            resetFailure.addSuppressed(cleanupFailure);
+          }
+        }
+      }
+    }
   }
 
   public void callWindowFocusChanged(boolean hasFocus) {
