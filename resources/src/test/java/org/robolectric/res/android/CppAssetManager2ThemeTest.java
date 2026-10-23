@@ -63,8 +63,11 @@ public class CppAssetManager2ThemeTest {
   @Test
   public void copyingAcrossAssetManagersRetainsSystemAttributesAndClearsAppAttributes() {
     BagAssetManager sourceAssets = new BagAssetManager();
-    sourceAssets.addStyle(STYLE, 0x10,
-        entry(SYSTEM_ATTRIBUTE, TYPE_INT_DEC, 12), entry(APP_ATTRIBUTE, TYPE_INT_DEC, 42));
+    sourceAssets.addStyle(
+        STYLE,
+        0x10,
+        entry(SYSTEM_ATTRIBUTE, TYPE_INT_DEC, 12),
+        entry(APP_ATTRIBUTE, TYPE_INT_DEC, 42));
     Theme source = sourceAssets.NewTheme();
     assertThat(source.ApplyStyle(STYLE, false)).isTrue();
     BagAssetManager destinationAssets = new BagAssetManager();
@@ -127,11 +130,16 @@ public class CppAssetManager2ThemeTest {
   @Test
   public void explicitEmptyAndNullAttributesKeepTheirNonForcedStyleBehaviorAfterCopy() {
     BagAssetManager assets = new BagAssetManager();
-    assets.addStyle(STYLE, 0x10,
+    assets.addStyle(
+        STYLE,
+        0x10,
         entry(APP_ATTRIBUTE, TYPE_NULL, DATA_NULL_EMPTY),
         entry(OTHER_APP_ATTRIBUTE, TYPE_NULL, DATA_NULL_UNDEFINED));
-    assets.addStyle(OTHER_STYLE, 0x20,
-        entry(APP_ATTRIBUTE, TYPE_INT_DEC, 42), entry(OTHER_APP_ATTRIBUTE, TYPE_INT_DEC, 73));
+    assets.addStyle(
+        OTHER_STYLE,
+        0x20,
+        entry(APP_ATTRIBUTE, TYPE_INT_DEC, 42),
+        entry(OTHER_APP_ATTRIBUTE, TYPE_INT_DEC, 73));
     Theme source = assets.NewTheme();
     assertThat(source.ApplyStyle(STYLE, false)).isTrue();
     Theme destination = assets.NewTheme();
@@ -159,6 +167,23 @@ public class CppAssetManager2ThemeTest {
     assertThat(destination.ApplyStyle(OTHER_STYLE, false)).isTrue();
     assertAttribute(destination, APP_ATTRIBUTE, TYPE_INT_DEC, 73, 0x30);
     assertMissing(source, APP_ATTRIBUTE);
+  }
+
+  @Test
+  public void applyingStyleRetainsReversePrecedenceAndBagEntryOrder() {
+    BagAssetManager assets = new BagAssetManager();
+    ResolvedBag.Entry first = entry(APP_ATTRIBUTE, TYPE_INT_DEC, 42);
+    ResolvedBag.Entry last = entry(APP_ATTRIBUTE, TYPE_INT_DEC, 73);
+    assets.addStyle(STYLE, 0x10, first, last);
+    Theme nonForced = assets.NewTheme();
+    Theme forced = assets.NewTheme();
+
+    assertThat(nonForced.ApplyStyle(STYLE, false)).isTrue();
+    assertThat(forced.ApplyStyle(STYLE, true)).isTrue();
+
+    assertAttribute(nonForced, APP_ATTRIBUTE, TYPE_INT_DEC, 73, 0x10);
+    assertAttribute(forced, APP_ATTRIBUTE, TYPE_INT_DEC, 42, 0x10);
+    assertThat(assets.GetBag(STYLE).entries).asList().containsExactly(first, last).inOrder();
   }
 
   private static ResolvedBag.Entry entry(int attribute, int dataType, int data) {
