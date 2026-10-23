@@ -1,5 +1,6 @@
 package org.robolectric.shadows;
 
+import static android.os.Build.VERSION_CODES.BAKLAVA;
 import static android.os.Build.VERSION_CODES.P;
 import static android.os.Build.VERSION_CODES.Q;
 
@@ -14,6 +15,7 @@ import android.graphics.RenderNode;
 import android.media.Image;
 import android.media.Image.Plane;
 import android.media.ImageReader;
+import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.view.Surface;
 import android.view.View;
@@ -30,6 +32,13 @@ import org.robolectric.util.ReflectionHelpers;
 /**
  * Helper class to provide hardware rendering-based screenshot to {@link ShadowPixelCopy} and {@link
  * ShadowUiAutomation}.
+ *
+ * <p>On SDK 36, set {@code robolectric.reuseHardwareScreenshotReader=true} to retain one reader
+ * between main-thread captures. The per-reader limit defaults to 4,194,304 pixels and can be set
+ * with {@code robolectric.hardwareScreenshotReaderMaxPixels}. Set {@code
+ * robolectric.hardwareScreenshotReaderCapacity=2} to retain two sizes. Their combined RGBA plane
+ * sizes must fit within {@code robolectric.hardwareScreenshotReaderMaxBytes} (20 MiB by default).
+ * The native allocator can reserve more memory than the plane sizes indicate.
  */
 public final class HardwareRenderingScreenshot {
 
@@ -38,9 +47,26 @@ public final class HardwareRenderingScreenshot {
   private static final WeakHashMap<ViewRootImpl, HardwareRenderer> hardwareRenderers =
       new WeakHashMap<>();
 
+  private static final HardwareScreenshotReaderSession readerSession =
+      new HardwareScreenshotReaderSession();
+
   static final String PIXEL_COPY_RENDER_MODE = "robolectric.pixelCopyRenderMode";
 
   static final String USE_EMBEDDED_VIEW_ROOT = "robolectric.useEmbeddedViewRoot";
+
+  static final String REUSE_SCREENSHOT_READER = "robolectric.reuseHardwareScreenshotReader";
+
+  static final String MAX_RETAINED_READER_PIXELS = "robolectric.hardwareScreenshotReaderMaxPixels";
+
+  static final String READER_CAPACITY = "robolectric.hardwareScreenshotReaderCapacity";
+
+  static final String MAX_RETAINED_READER_BYTES = "robolectric.hardwareScreenshotReaderMaxBytes";
+
+  // This limits retained dimensions. A reader can own several native buffers of this size.
+  private static final long DEFAULT_MAX_RETAINED_READER_PIXELS = 4_194_304;
+
+  // Capacity two charges both idle and leased readers against this nominal RGBA plane budget.
+  private static final long DEFAULT_MAX_RETAINED_READER_BYTES = 20L * 1024 * 1024;
 
   private HardwareRenderingScreenshot() {}
 
@@ -73,6 +99,13 @@ public final class HardwareRenderingScreenshot {
 
   /** Consumes the rendered RGBA plane synchronously while its ImageReader owns the pixels. */
   static <T> T capturePlane(View view, Function<Plane, T> consumePlane) {
+    // Reusing a target requires the SDK 36 renderer to detach it after each frame.
+    if (RuntimeEnvironment.getApiLevel() == BAKLAVA
+        && Boolean.getBoolean(REUSE_SCREENSHOT_READER)
+        && Looper.myLooper() == Looper.getMainLooper()) {
+      return capturePlaneWithReaderLease(view, consumePlane);
+    }
+
     int width = view.getWidth();
     int height = view.getHeight();
 
@@ -85,30 +118,7 @@ public final class HardwareRenderingScreenshot {
       try {
         if (RuntimeEnvironment.getApiLevel() >= Q) {
           // HardwareRenderer is only available on API 29+ (Q).
-          HardwareRenderer renderer =
-              hardwareRenderers.computeIfAbsent(
-                  viewRootImpl,
-                  k -> {
-                    // Default to true because Views' RenderNodeAnimators write to the native
-                    // RootRenderNode state. For highest fidelity, we want to use the
-                    // HardwareRenderer that is attached to the ViewRootImpl.
-                    if (Boolean.parseBoolean(System.getProperty(USE_EMBEDDED_VIEW_ROOT, "true"))) {
-                      ShadowViewRootImpl shadowViewRootImpl = Shadow.extract(viewRootImpl);
-                      // Using Object here is required to avoid a VerifyError when this lambda class
-                      // is loaded on SDK < 29, where ThreadedRenderer is not a subclass of
-                      // HardwareRenderer.
-                      Object threadedRenderer = shadowViewRootImpl.getThreadedRenderer();
-                      return (HardwareRenderer) threadedRenderer;
-                    } else {
-                      return new HardwareRenderer();
-                    }
-                  });
-
-          renderer.setSurface(surface);
-          setupRendererShadowProperties(renderer, view);
-          RenderNode node = getRenderNode(view);
-          renderer.setContentRoot(node);
-          renderer.createRenderRequest().syncAndDraw();
+          render(getRenderer(viewRootImpl), surface, view);
         } else {
           // Note this API does not set any light source properties, so it will not render
           // drop shadows.
@@ -122,6 +132,80 @@ public final class HardwareRenderingScreenshot {
       } finally {
         surface.release();
       }
+    }
+  }
+
+  /** Clears sandbox-owned readers through ShadowViewRootImpl's registered reset hook. */
+  static void clearReaderSession() {
+    readerSession.clear();
+  }
+
+  private static <T> T capturePlaneWithReaderLease(View view, Function<Plane, T> consumePlane) {
+    long maxPixels = Long.getLong(MAX_RETAINED_READER_PIXELS, DEFAULT_MAX_RETAINED_READER_PIXELS);
+    int capacity = Integer.getInteger(READER_CAPACITY, 1);
+    long maxBytes =
+        capacity == 2
+            ? Long.getLong(MAX_RETAINED_READER_BYTES, DEFAULT_MAX_RETAINED_READER_BYTES)
+            : Long.MAX_VALUE;
+    try (HardwareScreenshotReaderSession.Lease lease =
+        readerSession.borrow(view.getWidth(), view.getHeight(), maxPixels, capacity, maxBytes)) {
+      ViewRootImpl viewRootImpl =
+          Objects.requireNonNull(view.getViewRootImpl(), "View not attached");
+      ImageReader reader = lease.reader();
+      T result;
+      try (CaptureTarget target = new CaptureTarget(getRenderer(viewRootImpl))) {
+        render(target.renderer, reader.getSurface(), view);
+        try (Image image = reader.acquireNextImage()) {
+          result = consumePlane.apply(image.getPlanes()[0]);
+        }
+      }
+      // Image close and target detach must both succeed before returning the reader to the cache.
+      lease.markReusable();
+      return result;
+    }
+  }
+
+  private static HardwareRenderer getRenderer(ViewRootImpl viewRootImpl) {
+    return hardwareRenderers.computeIfAbsent(
+        viewRootImpl,
+        k -> {
+          // Default to true because Views' RenderNodeAnimators write to the native
+          // RootRenderNode state. For highest fidelity, we want to use the
+          // HardwareRenderer that is attached to the ViewRootImpl.
+          if (Boolean.parseBoolean(System.getProperty(USE_EMBEDDED_VIEW_ROOT, "true"))) {
+            ShadowViewRootImpl shadowViewRootImpl = Shadow.extract(viewRootImpl);
+            // Using Object here is required to avoid a VerifyError when this lambda class
+            // is loaded on SDK < 29, where ThreadedRenderer is not a subclass of
+            // HardwareRenderer.
+            Object threadedRenderer = shadowViewRootImpl.getThreadedRenderer();
+            return (HardwareRenderer) threadedRenderer;
+          } else {
+            return new HardwareRenderer();
+          }
+        });
+  }
+
+  private static void render(HardwareRenderer renderer, Surface surface, View view) {
+    renderer.setSurface(surface);
+    setupRendererShadowProperties(renderer, view);
+    RenderNode node = getRenderNode(view);
+    renderer.setContentRoot(node);
+    renderer.createRenderRequest().syncAndDraw();
+  }
+
+  /** Detaches the borrowed Surface while preserving the ViewRoot-owned renderer and animations. */
+  private static final class CaptureTarget implements AutoCloseable {
+    final HardwareRenderer renderer;
+
+    CaptureTarget(HardwareRenderer renderer) {
+      this.renderer = renderer;
+    }
+
+    @Override
+    public void close() {
+      // Failure discards the outer reader lease. The ViewRoot-owned renderer may retain the
+      // closed target until its next successful attachment or ordinary lifecycle cleanup.
+      renderer.setSurface(null);
     }
   }
 
