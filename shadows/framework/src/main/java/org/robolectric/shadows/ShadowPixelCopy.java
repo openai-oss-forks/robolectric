@@ -8,6 +8,7 @@ import static org.robolectric.util.reflector.Reflector.reflector;
 
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
+import android.graphics.ColorSpace;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.media.Image;
@@ -24,6 +25,7 @@ import android.view.View;
 import android.view.ViewRootImpl;
 import android.view.Window;
 import android.view.WindowManagerGlobal;
+import java.nio.ByteBuffer;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import javax.annotation.Nonnull;
@@ -254,18 +256,33 @@ public class ShadowPixelCopy {
   private static void takeScreenshot(View view, Bitmap screenshot, @Nullable Rect srcRect) {
     validateBitmap(screenshot);
 
-    Bitmap bitmap = Bitmap.createBitmap(view.getWidth(), view.getHeight(), Bitmap.Config.ARGB_8888);
+    int width = view.getWidth();
+    int height = view.getHeight();
+    boolean hardware = HardwareRenderingScreenshot.canTakeScreenshot(view);
+    Bitmap bitmap;
+    if (hardware) {
+      bitmap =
+          PerfStatsCollector.getInstance()
+              .measure(
+                  "ShadowPixelCopy-Hardware",
+                  () ->
+                      HardwareRenderingScreenshot.capturePlane(
+                          view, plane -> copyPlane(plane, screenshot, srcRect, width, height)));
+      if (bitmap == null) {
+        return;
+      }
+    } else {
+      bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+    }
+
     try {
-      if (HardwareRenderingScreenshot.canTakeScreenshot(view)) {
-        PerfStatsCollector.getInstance()
-            .measure(
-                "ShadowPixelCopy-Hardware",
-                () -> HardwareRenderingScreenshot.takeScreenshot(view, bitmap));
+      if (hardware) {
         drawScreenshot(bitmap, srcRect, screenshot);
       } else {
         Canvas canvas = new Canvas(bitmap);
         try {
-          PerfStatsCollector.getInstance().measure("ShadowPixelCopy-Software", () -> view.draw(canvas));
+          PerfStatsCollector.getInstance()
+              .measure("ShadowPixelCopy-Software", () -> view.draw(canvas));
           drawScreenshot(bitmap, srcRect, screenshot);
         } finally {
           // Detach after the copy. The View may have left saved layers on its Canvas.
@@ -274,6 +291,33 @@ public class ShadowPixelCopy {
       }
     } finally {
       bitmap.recycle();
+    }
+  }
+
+  /**
+   * Returns a full-frame bitmap for the Canvas fallback, or null if the destination is complete.
+   */
+  @Nullable
+  private static Bitmap copyPlane(
+      Plane plane, Bitmap destination, @Nullable Rect srcRect, int width, int height) {
+    ByteBuffer pixels = plane.getBuffer();
+    if (copyOpaquePlane(
+        pixels,
+        plane.getRowStride(),
+        plane.getPixelStride(),
+        destination,
+        srcRect,
+        width,
+        height)) {
+      return null;
+    }
+    Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+    try {
+      bitmap.copyPixelsFromBuffer(pixels);
+      return bitmap;
+    } catch (RuntimeException | Error failure) {
+      bitmap.recycle();
+      throw failure;
     }
   }
 
@@ -286,6 +330,82 @@ public class ShadowPixelCopy {
       // The caller owns the destination and can recycle it as soon as PixelCopy returns.
       canvas.setBitmap(null);
     }
+  }
+
+  /**
+   * Copies an opaque, unscaled RGBA rectangle when SrcOver would overwrite every destination pixel.
+   * Check every selected alpha before modifying the destination. Rows with gaps need a packed copy.
+   */
+  static boolean copyOpaquePlane(
+      ByteBuffer pixels,
+      int rowStride,
+      int pixelStride,
+      Bitmap destination,
+      @Nullable Rect sourceRect,
+      int width,
+      int height) {
+    int left = sourceRect == null ? 0 : sourceRect.left;
+    int top = sourceRect == null ? 0 : sourceRect.top;
+    int right = sourceRect == null ? width : sourceRect.right;
+    int bottom = sourceRect == null ? height : sourceRect.bottom;
+    if (width <= 0
+        || height <= 0
+        || left < 0
+        || top < 0
+        || right > width
+        || bottom > height
+        || right <= left
+        || bottom <= top) {
+      return false;
+    }
+    int cropWidth = right - left;
+    int cropHeight = bottom - top;
+    long cropRowBytes = (long) cropWidth * 4;
+    if (destination.getWidth() != cropWidth
+        || destination.getHeight() != cropHeight
+        || !destination.isMutable()
+        || destination.getConfig() != Bitmap.Config.ARGB_8888
+        || !destination.isPremultiplied()
+        || !ColorSpace.get(ColorSpace.Named.SRGB).equals(destination.getColorSpace())
+        || pixelStride != 4
+        || rowStride < (long) width * 4
+        || destination.getRowBytes() != cropRowBytes) {
+      return false;
+    }
+    long byteCount = cropRowBytes * cropHeight;
+    // The last selected pixel must fit; ImageReader may omit padding after its final row.
+    long requiredBytes = (long) (bottom - 1) * rowStride + (long) right * 4;
+    if (byteCount > Integer.MAX_VALUE || requiredBytes > pixels.remaining()) {
+      return false;
+    }
+    int position = pixels.position();
+    // ImageReader produces RGBA_8888. Only selected pixels contribute to the original SrcOver draw.
+    for (int y = top; y < bottom; y++) {
+      int rowStart = (int) (position + (long) y * rowStride + (long) left * 4);
+      for (int offset = 3; offset < cropRowBytes; offset += 4) {
+        if (pixels.get(rowStart + offset) != (byte) 0xff) {
+          return false;
+        }
+      }
+    }
+    if (left == 0 && top == 0 && right == width && bottom == height && rowStride == cropRowBytes) {
+      destination.copyPixelsFromBuffer(pixels);
+    } else if (cropHeight == 1 || rowStride == cropRowBytes) {
+      // A single row or a run of complete rows is already packed.
+      ByteBuffer source = pixels.duplicate();
+      source.position(position + top * rowStride + left * 4);
+      destination.copyPixelsFromBuffer(source);
+    } else {
+      // Pack rows whose stride includes pixels or padding outside the crop.
+      byte[] croppedPixels = new byte[(int) byteCount];
+      ByteBuffer source = pixels.duplicate();
+      for (int y = top; y < bottom; y++) {
+        source.position((int) (position + (long) y * rowStride + (long) left * 4));
+        source.get(croppedPixels, (int) ((y - top) * cropRowBytes), (int) cropRowBytes);
+      }
+      destination.copyPixelsFromBuffer(ByteBuffer.wrap(croppedPixels));
+    }
+    return true;
   }
 
   private static void alertFinished(
